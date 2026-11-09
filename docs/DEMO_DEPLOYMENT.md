@@ -142,6 +142,51 @@ unset BALANCEVAULT_BOOTSTRAP_DATABASE_URL
 
 Never set the bootstrap URL on Render. This command creates only the first ADMIN; auditors/admins after that use the existing invitation workflow.
 
+## 4a. Exceptional direct provisioning for a jury demo
+
+Use the invitation workflow for additional administrators whenever possible. For a controlled jury demo only, an authorized database owner can create a separate active administrator directly. This bypasses invitation controls and must not be used for production provisioning. Connect to the intended demo database using the direct Neon endpoint and the authorized owner login; do not grant permanent `INSERT` privileges to an application login. Confirm the active administrator ID below belongs to the demo database before running the transaction.
+
+Generate a bcrypt hash locally using a temporary password that meets the application's password requirements. Do not put the password or hash in this repository, shell history, a SQL file, or a shared jury document. For example, from `apps/api` use a local Node script with the installed `bcrypt` package and enter the password through a hidden prompt; provide only the resulting hash to the SQL session. A cost factor of 12 is supported. Deliver the temporary password to the jury through a private channel and rotate it after the demo.
+
+Replace `<ADMIN_NAME>`, `<ADMIN_EMAIL>`, and `<BCRYPT_HASH>` before execution. Keep the actor ID set to the active demo administrator. The transaction checks that actor and records the new administrator in `AuditLog`:
+
+```sql
+BEGIN;
+
+DO $$
+DECLARE
+  v_user_id uuid := gen_random_uuid();
+  v_actor_id uuid := 'eacd8dcc-c903-4491-bbcf-b41c13272feb';
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public."User"
+    WHERE id = v_actor_id AND role = 'ADMIN' AND "isActive" = true
+  ) THEN
+    RAISE EXCEPTION 'Active admin not found';
+  END IF;
+
+  INSERT INTO public."User" (
+    id, "fullName", email, "passwordHash", role, "isActive", "updatedAt"
+  ) VALUES (
+    v_user_id, '<ADMIN_NAME>', '<ADMIN_EMAIL>', '<BCRYPT_HASH>',
+    'ADMIN', true, NOW()
+  );
+
+  INSERT INTO public."AuditLog" (
+    id, "actorId", action, "entityType", "entityId", metadata, "createdAt"
+  ) VALUES (
+    gen_random_uuid(), v_actor_id, 'ADMIN_CREATED_DIRECTLY', 'User', v_user_id,
+    '{"role":"ADMIN","method":"direct_sql"}'::jsonb, NOW()
+  );
+
+  RAISE NOTICE 'New admin created: %', v_user_id;
+END $$;
+
+COMMIT;
+```
+
+If any statement fails, the transaction must be rolled back. Afterward, verify the new account can sign in and that the audit event is visible. Do not publish a working password in this guide. The existing jury test administrator is `BV-ADMIN` (`bv@gmail.com`, user ID `eacd8dcc-c903-4491-bbcf-b41c13272feb`); share its temporary password only through the private jury channel and change it after the demo.
+
 ## 5. Create the Vercel frontend
 
 Import the repository into Vercel. Keep the project root directory at the repository root so Vercel can use the root npm workspaces and lockfile. The checked-in `vercel.json` sets the Vite framework, install/build commands, `apps/web/dist` output, SPA deep-link rewrites, and frontend security headers.
