@@ -14,6 +14,7 @@ if ([...(process.env.JWT_ACCESS_SECRET ?? '')].length < 32) {
 }
 
 const { Client } = pg;
+const testRunId = randomUUID();
 const databaseUrl = process.env.BALANCEVAULT_TEST_DATABASE_URL;
 const runtimeDatabaseUrl = process.env.BALANCEVAULT_TEST_RUNTIME_DATABASE_URL;
 const databaseName = databaseUrl ? new URL(databaseUrl).pathname.slice(1) : '';
@@ -295,6 +296,20 @@ test('financial HTTP endpoints persist through the PostgreSQL runtime role', {
     statementCursor = body.nextCursor;
   } while (statementCursor);
 
+  if (statementPages.length !== 4) {
+    console.error('financial_statement_diagnostic', JSON.stringify({
+      testRunId,
+      eventCount: statementPages.length,
+      events: statementPages.map((event) => ({
+        eventId: event.id,
+        type: event.type,
+        accountId: 'accountA',
+        status: event.status,
+        amountPaise: event.amountPaise,
+        reference: event.reference,
+      })),
+    }));
+  }
   assert.equal(statementPages.length, 4);
   assert.equal(new Set(statementPages.map((event) => event.id)).size, 4);
   assert.deepEqual(statementPages.map((event) => event.status), ['POSTED', 'POSTED', 'POSTED', 'REFUSED']);
