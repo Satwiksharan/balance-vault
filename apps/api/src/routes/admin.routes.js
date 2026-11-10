@@ -20,6 +20,21 @@ const invitationSchema = z.strictObject({
 });
 function sqlState(error) { return error?.meta?.driverAdapterError?.cause?.originalCode ?? error?.meta?.code ?? error?.cause?.code; }
 
+function invitationFailureCategory(error) {
+  const message = error?.meta?.driverAdapterError?.cause?.message ?? error?.cause?.message ?? '';
+  if (sqlState(error) === '55000' && /^Actor assertion verifier is not provisioned$/i.test(message)) {
+    return 'actor_assertion_verifier_unavailable';
+  }
+  if (sqlState(error) !== '42501') return 'database_authorization_failure';
+  if (/^Actor assertion signature is invalid$/i.test(message)) return 'actor_assertion_signature_invalid';
+  if (/^Actor assertion payload does not match$/i.test(message)) return 'actor_assertion_context_mismatch';
+  if (/^Expired actor assertion$/i.test(message)) return 'actor_assertion_expired';
+  if (/^Actor assertion has already been used$/i.test(message)) return 'actor_assertion_replay';
+  if (/^Invalid actor assertion$/i.test(message)) return 'actor_assertion_invalid';
+  if (/^Active administrator required$/i.test(message)) return 'active_administrator_check_failed';
+  return 'database_authorization_failure';
+}
+
 export function createAdminRouter(prismaClient) {
   const router = Router();
   router.use(createAuthenticate(prismaClient));
@@ -46,7 +61,16 @@ export function createAdminRouter(prismaClient) {
       response.set('Cache-Control', 'no-store');
       return response.status(201).json({ invitation: { ...invitation, token } });
     } catch (error) {
-      if (sqlState(error) === '42501') return response.status(403).json({ error: 'Administrator authorization is required' });
+      if (sqlState(error) === '42501' || sqlState(error) === '55000') {
+        console.warn('Admin invitation rejected by PostgreSQL', {
+          requestId: request.id,
+          category: invitationFailureCategory(error),
+        });
+        if (sqlState(error) === '55000') {
+          return response.status(503).json({ error: 'Invitation service is temporarily unavailable' });
+        }
+        return response.status(403).json({ error: 'Administrator authorization is required' });
+      }
       if (sqlState(error) === '23505') return response.status(409).json({ error: 'Email is already registered or has an active invitation' });
       if (sqlState(error) === '22023') return response.status(400).json({ error: 'Invitation details are invalid' });
       return next(error);

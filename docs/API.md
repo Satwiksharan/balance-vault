@@ -16,7 +16,7 @@ Login, registration, invitation acceptance, and password changes use shared Redi
 - `GET /api/accounts` lists customer accounts available to the caller. ADMIN sees all customer accounts; ACCOUNT_HOLDER and AUDITOR see only accounts with `canView=true`. Clearing accounts are excluded.
 - `GET /api/accounts/{accountId}` returns a visible customer account summary.
 - `GET /api/accounts/{accountId}/balance` returns `{ accountId, balancePaise, currencyCode }`; `balancePaise` is an integer string.
-- `POST /api/accounts` is ADMIN-only and accepts `{ "accountNumber": "BV-10021", "accountType": "PERSONAL", "holderUserId": "uuid" }`. Account and initial view permission are created through a protected PostgreSQL function.
+- `POST /api/accounts` is ADMIN-only and accepts `{ "accountNumber": "BV-10021", "accountType": "PERSONAL", "holderUserId": "uuid" }`. Account and initial view/deposit permissions are created through a protected PostgreSQL function. Withdrawal and transfer permissions remain disabled.
 
 Unknown and unauthorized account IDs return `404` to avoid disclosing account existence. Invalid IDs and request bodies return `400`; a duplicate account number returns `409`.
 
@@ -29,7 +29,7 @@ All posting requests require an authenticated caller and an `Idempotency-Key` he
 - `POST /api/transfers` accepts `{ "sourceAccountId": "uuid", "destinationAccountId": "uuid", "amountPaise": "2500" }`.
 - `GET /api/transfers/{transferId}` returns a posted transfer only when the caller can view both customer accounts (ADMIN may read any customer-to-customer transfer).
 
-Active ADMIN users may post deposits, withdrawals, and transfers against any eligible customer accounts. ACCOUNT_HOLDER users must have the operation-specific account capability (`canDeposit`, `canWithdraw`, or `canTransfer`) for the relevant account. AUDITOR users cannot post transactions. The database also checks account status, funds, and transfer eligibility. A repeated idempotency key with the same payload replays its original result; reusing it with different arguments returns `409`. Insufficient funds and other financial refusals are persisted as refused attempts and do not create ledger entries. Backend database errors are returned as generic `500` errors.
+Active ADMIN users may post deposits, withdrawals, and transfers against any eligible customer accounts. ACCOUNT_HOLDER users must have the operation-specific account capability (`canDeposit`, `canWithdraw`, or `canTransfer`) for the relevant account. New accounts receive view and deposit access for their initial holder; withdrawals and transfers remain disabled. AUDITOR users cannot post transactions. The database also checks account status, funds, and transfer eligibility. A repeated idempotency key with the same payload replays its original result; reusing it with different arguments returns `409`. Insufficient funds and other financial refusals are persisted as refused attempts and do not create ledger entries. Backend database errors are returned as generic `500` errors.
 
 ## Account statement
 
@@ -125,7 +125,7 @@ All routes below require a bearer access token.
 - `POST /api/auth/change-password` accepts `{ "currentPassword": "…", "newPassword": "at least 12 characters" }`. It checks the current password, persists the bcrypt hash through a restricted function, invalidates older access tokens, and returns a message requiring a new login.
 - `POST /api/account-requests` accepts `{ "requestedType": "PERSONAL" }` or `BUSINESS`. A duplicate pending request returns `409`.
 - `GET /api/account-requests` returns the caller's requests. `GET /api/account-requests/admin/queue` is ADMIN-only.
-- `POST /api/account-requests/admin/:id/approve` (ADMIN-only) accepts `{ "accountNumber": "…" }`; it uses the existing account creation function inside the request transaction, so the account and initial view permission commit together.
+- `POST /api/account-requests/admin/:id/approve` (ADMIN-only) accepts `{ "accountNumber": "…" }`; it uses the existing account creation function inside the request transaction, so the account and initial view/deposit permissions commit together.
 - `POST /api/account-requests/admin/:id/reject` (ADMIN-only) accepts an optional `{ "note": "…" }`.
 - `GET /api/admin/users?page=1&perPage=25` and `PATCH /api/admin/users/:id/status` are ADMIN-only. The latter accepts only `{ "isActive": true|false }`; role changes remain controlled provisioning.
 

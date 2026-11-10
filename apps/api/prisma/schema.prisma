@@ -73,9 +73,10 @@ model User {
 }
 
 /// Customer account access is granted through AccountPermission. Create the account
-/// and at least one ACCOUNT_HOLDER permission atomically. System clearing accounts
-/// use stable systemCode values such as CLEARING_DEPOSIT_INR and
-/// CLEARING_WITHDRAWAL_INR and must not receive customer permissions.
+/// and its initial ACCOUNT_HOLDER permission atomically with view and deposit access;
+/// withdrawal and transfer access remain separate. System clearing accounts use
+/// stable systemCode values such as CLEARING_DEPOSIT_INR and CLEARING_WITHDRAWAL_INR
+/// and must not receive customer permissions.
 model Account {
   id                    String                @id @default(uuid()) @db.Uuid
   accountNumber         String                @unique
@@ -151,8 +152,8 @@ model AccountPermission {
   id           String   @id @default(uuid()) @db.Uuid
   userId       String   @db.Uuid
   accountId    String   @db.Uuid
-  /// All capabilities are denied by default. Account creation must atomically
-  /// grant canView=true to the initial authorized ACCOUNT_HOLDER.
+  /// All capabilities are denied by default. Account creation grants canView and
+  /// canDeposit only to the initial authorized ACCOUNT_HOLDER.
   canView      Boolean  @default(false)
   canDeposit   Boolean  @default(false)
   canWithdraw  Boolean  @default(false)

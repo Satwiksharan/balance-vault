@@ -106,6 +106,12 @@ test('account creation function privileges and authenticated HTTP creation are e
 
   const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: runtimeDatabaseUrl }) });
   await verifyRuntimeDatabaseIdentity(prisma);
+  await admin.query(`
+    INSERT INTO public."Account" ("id", "accountNumber", "systemCode", "type", "status", "balancePaise", "currencyCode", "updatedAt")
+    VALUES ('00000000-0000-0000-0000-000000000012', 'BV-CLEAR-DEP', 'CLEARING_DEPOSIT_INR',
+            'SYSTEM_CLEARING', 'ACTIVE', 0, 'INR', clock_timestamp())
+    ON CONFLICT ("systemCode") DO NOTHING
+  `);
   const instance = await listen(createApp({ prismaClient: prisma }));
   const accountNumber = `BV-${randomUUID()}`;
   const accessToken = jwt.sign({ role: 'ADMIN', ver: 0 }, process.env.JWT_ACCESS_SECRET, {
@@ -139,12 +145,68 @@ test('account creation function privileges and authenticated HTTP creation are e
     assert.deepEqual(records.rows[0], {
       userId: holderId,
       canView: true,
-      canDeposit: false,
+      canDeposit: true,
       canWithdraw: false,
       canTransfer: false,
       balancePaise: '0',
       systemCode: null,
     });
+
+    const holderToken = jwt.sign({ ver: 0 }, process.env.JWT_ACCESS_SECRET, {
+      algorithm: 'HS256',
+      subject: holderId,
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+      expiresIn: '15m',
+    });
+    const clearingOpeningBalance = await admin.query(
+      `SELECT "balancePaise"::text AS balance FROM public."Account"
+        WHERE "id"='00000000-0000-0000-0000-000000000012'`,
+    );
+    assert.equal(clearingOpeningBalance.rowCount, 1);
+    const depositResponse = await fetch(`${instance.url}/api/deposits`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${holderToken}`,
+        'content-type': 'application/json',
+        'Idempotency-Key': `account-creation-deposit-${randomUUID()}`,
+      },
+      body: JSON.stringify({ accountId: account.id, amountPaise: '12500' }),
+    });
+    assert.equal(depositResponse.status, 201);
+    const deposit = await depositResponse.json();
+    assert.equal(deposit.status, 'POSTED');
+
+    const postings = await admin.query(
+      `SELECT "accountId", "amountPaise"::text AS amount FROM public."LedgerEntry"
+        WHERE "journalTransactionId"=$1 ORDER BY "accountId"`,
+      [deposit.journalTransactionId],
+    );
+    assert.deepEqual(postings.rows, [
+      { accountId: account.id, amount: '12500' },
+      { accountId: '00000000-0000-0000-0000-000000000012', amount: '-12500' },
+    ].sort((left, right) => left.accountId.localeCompare(right.accountId)));
+    const balances = await admin.query(
+      `SELECT "id", "balancePaise"::text AS balance FROM public."Account"
+        WHERE "id" = ANY($1::uuid[]) ORDER BY "id"`,
+      [[account.id, '00000000-0000-0000-0000-000000000012']],
+    );
+    assert.deepEqual(balances.rows, [
+      { id: account.id, balance: '12500' },
+      {
+        id: '00000000-0000-0000-0000-000000000012',
+        balance: (BigInt(clearingOpeningBalance.rows[0].balance) - 12500n).toString(),
+      },
+    ].sort((left, right) => left.id.localeCompare(right.id)));
+    const depositAudit = await admin.query(
+      `SELECT "actorId", action, "entityId" FROM public."AuditLog" WHERE "entityId"=$1`,
+      [deposit.journalTransactionId],
+    );
+    assert.deepEqual(depositAudit.rows, [{
+      actorId: holderId,
+      action: 'TRANSACTION_POSTED',
+      entityId: deposit.journalTransactionId,
+    }]);
 
     const audit = await admin.query(
       `SELECT "actorId",action,"entityType","entityId" FROM public."AuditLog" WHERE "entityId"=$1`,

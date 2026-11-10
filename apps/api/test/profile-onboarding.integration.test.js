@@ -5,9 +5,8 @@ import bcrypt from 'bcryptjs';
 import pg from 'pg';
 import { createActorAssertion } from '../src/config/actor-assertion.js';
 
-if (!process.env.BALANCEVAULT_ACTOR_ASSERTION_KEY) {
-  process.env.BALANCEVAULT_ACTOR_ASSERTION_KEY = 'ef'.repeat(32);
-}
+const testActorKey = process.env.BALANCEVAULT_TEST_ACTOR_ASSERTION_KEY ?? 'ef'.repeat(32);
+process.env.BALANCEVAULT_ACTOR_ASSERTION_KEY = testActorKey;
 
 const { Client } = pg;
 const adminUrl = process.env.BALANCEVAULT_TEST_DATABASE_URL;
@@ -33,6 +32,17 @@ before(async () => {
   if (!enabled) return;
   admin = await connect(adminUrl);
   runtime = await connect(runtimeUrl);
+  await admin.query('SET ROLE balancevault_auth_owner');
+  try {
+    await admin.query(
+      `INSERT INTO balancevault_auth_private.actor_assertion_key (singleton, secret)
+       VALUES (true, $1)
+       ON CONFLICT (singleton) DO UPDATE SET secret = EXCLUDED.secret`,
+      [Buffer.from(testActorKey, 'hex')],
+    );
+  } finally {
+    await admin.query('RESET ROLE');
+  }
 });
 after(async () => { if (runtime) await runtime.end(); if (admin) await admin.end(); });
 
@@ -78,7 +88,7 @@ test('profiles, password changes, user status and account onboarding preserve da
     `SELECT "canView","canDeposit","canWithdraw","canTransfer" FROM public."AccountPermission" WHERE "userId"=$1 AND "accountId"=$2`,
     [holderId, opened.rows[0].id],
   );
-  assert.deepEqual(permission.rows[0], { canView: true, canDeposit: false, canWithdraw: false, canTransfer: false });
+  assert.deepEqual(permission.rows[0], { canView: true, canDeposit: true, canWithdraw: false, canTransfer: false });
 
   await assert.rejects(
     runtime.query('SELECT public.admin_set_user_active($1,$2,false) AS changed', [adminId, holderId]),

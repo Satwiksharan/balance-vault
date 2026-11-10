@@ -18,7 +18,7 @@ Use separate login identities and credentials. The API must never receive migrat
 
 ## Migration history
 
-The repository contains eleven ordered migrations, ending in `20261109000000_admin_transaction_access`. They create the ledger and access controls, onboarding/profile workflows, privileged-user provisioning, password-hash isolation, actor assertions, constant-time HMAC comparison, and ADMIN transaction access. Use only forward migrations. Never edit a migration already applied to an environment.
+The repository contains twelve ordered migrations, ending in `20261110000000_account_holder_deposits`. They create the ledger and access controls, onboarding/profile workflows, privileged-user provisioning, password-hash isolation, actor assertions, constant-time HMAC comparison, ADMIN transaction access, and account-holder deposit access. Use only forward migrations. Never edit a migration already applied to an environment.
 
 Provision database roles and an empty database first. The migration login must own the database and `public` schema. Apply migrations through the protected migration job using `MIGRATION_DATABASE_URL`; verify with `npm run db:migrate` and `prisma migrate status`. Provision the actor assertion key using the protected CLI after migrations. Bootstrap the first administrator separately with `BALANCEVAULT_BOOTSTRAP_DATABASE_URL`.
 

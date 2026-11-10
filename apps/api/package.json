@@ -11,7 +11,7 @@
     "start": "node src/server.js",
     "test": "node --test --test-concurrency=1",
     "db:generate": "prisma generate",
-    "db:migrate": "prisma migrate deploy --config prisma.migrate.config.js",
+    "db:migrate": "node scripts/migrate-deploy.js",
     "db:studio": "prisma studio",
     "ledger:reconcile": "node scripts/reconcile-ledger.js",
     "admin:bootstrap": "node scripts/bootstrap-admin.js",
