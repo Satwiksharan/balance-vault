@@ -207,6 +207,12 @@ Copy the Vercel production origin into Render's `WEB_ORIGIN`, save, and deploy/r
 4. Browser developer tools show successful API requests, TLS connections, and no CORS/CSP errors.
 5. Login, account views, and audit views work using synthetic demo accounts only.
 
+### Troubleshooting invitations and deposits
+
+If creating an ADMIN/AUDITOR invitation returns **“Administrator authorization is required”**, check that the `20261108002000_security_hardening` and `20261108003000_constant_time_actor_assertion` migrations are applied, and that the API's `BALANCEVAULT_ACTOR_ASSERTION_KEY` matches the verifier provisioned in this same Neon database. Provision the verifier through the protected command in section 1; the key itself must never be printed or committed. A missing verifier is a separate setup error, and changing an already provisioned key requires the documented coordinated rotation procedure.
+
+Active ADMIN users can post deposits, withdrawals, and transfers on eligible customer accounts. `ACCOUNT_HOLDER` users need the matching account permission (`canDeposit`, `canWithdraw`, or `canTransfer`) for the selected account. Account opening currently grants `canView` only, so a visible account may still refuse a holder's deposit. An ADMIN may use the transaction actions in the operations workspace; all postings still go through the audited PostgreSQL ledger function. Do not work around a refusal by changing ledger balances directly.
+
 Do not use real funds, real credentials, or sensitive personal data in this free demo. Render documents free web services as non-production and subject to sleep/restarts; Neon/Upstash free-tier quotas and persistence/availability should be checked in their current dashboards before the demo.
 
 ## Provider references

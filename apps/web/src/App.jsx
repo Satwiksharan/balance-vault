@@ -284,7 +284,7 @@ function DashboardPage({ request, user, accountRefreshVersion }) {
         </section>}
       </div>
 
-      {user.role === 'ADMIN' && <section className="section-block role-dashboard-panel"><span className="section-kicker">ADMINISTRATION</span><h2>Operations workspace</h2><p>Review account opening requests, manage user access, and inspect the audit trail.</p><div className="role-dashboard-actions"><button className="button button-outline" onClick={() => navigate('/admin/onboarding')}>Review onboarding</button><button className="button button-outline" onClick={() => navigate('/admin/users')}>Manage users</button><button className="button button-outline" onClick={() => navigate('/audit')}>View audit log</button></div></section>}
+      {user.role === 'ADMIN' && <section className="section-block role-dashboard-panel"><span className="section-kicker">ADMINISTRATION</span><h2>Operations workspace</h2><p>Review account opening requests, manage user access, inspect the audit trail, and process customer transactions.</p><div className="role-dashboard-actions"><button className="button button-outline" onClick={() => navigate('/admin/onboarding')}>Review onboarding</button><button className="button button-outline" onClick={() => navigate('/admin/users')}>Manage users</button><button className="button button-outline" onClick={() => navigate('/audit')}>View audit log</button></div><div className="role-dashboard-actions"><button className="button button-outline" onClick={() => navigate('/transactions/deposit')}>Deposit</button><button className="button button-outline" onClick={() => navigate('/transactions/withdrawal')}>Withdrawal</button><button className="button button-outline" onClick={() => navigate('/transactions/transfer')}>Transfer</button></div></section>}
       {user.role === 'AUDITOR' && <section className="section-block role-dashboard-panel"><span className="section-kicker">READ ONLY</span><h2>Audit workspace</h2><p>Review assigned-account statements and the audit events available to your role.</p><button className="button button-outline" onClick={() => navigate('/audit')}>Open audit log</button></section>}
       <DashboardActivity request={request} accounts={accounts} />
     </>
@@ -603,7 +603,7 @@ function AppRouter() {
     (pathname === '/account-requests' && user.role !== 'ACCOUNT_HOLDER')
     || (pathname.startsWith('/admin/') && user.role !== 'ADMIN')
     || (pathname === '/audit' && !['ADMIN', 'AUDITOR'].includes(user.role))
-    || (transactionRoute && user.role !== 'ACCOUNT_HOLDER')
+    || (transactionRoute && !['ACCOUNT_HOLDER', 'ADMIN'].includes(user.role))
   );
 
   useEffect(() => {
