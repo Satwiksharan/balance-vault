@@ -66,7 +66,12 @@ async function createTestUser(role) {
   return id;
 }
 
-async function createFinancialFixture(accountCount = 2) {
+async function createFinancialFixture(accountCount = 2, capabilities = {
+  canView: true,
+  canDeposit: true,
+  canWithdraw: true,
+  canTransfer: true,
+}) {
   const userId = randomUUID();
   const accountIds = Array.from({ length: accountCount }, () => randomUUID());
   await admin.query('BEGIN');
@@ -85,8 +90,9 @@ async function createFinancialFixture(accountCount = 2) {
       await admin.query(
         `INSERT INTO public."AccountPermission"
           (id,"userId","accountId","canView","canDeposit","canWithdraw","canTransfer","updatedAt")
-         VALUES ($1,$2,$3,true,true,true,true,clock_timestamp())`,
-        [randomUUID(), userId, accountId],
+         VALUES ($1,$2,$3,$4,$5,$6,$7,clock_timestamp())`,
+        [randomUUID(), userId, accountId, capabilities.canView, capabilities.canDeposit,
+          capabilities.canWithdraw, capabilities.canTransfer],
       );
     }
     await admin.query('COMMIT');
@@ -252,6 +258,19 @@ test('financial HTTP endpoints persist through the PostgreSQL runtime role', {
   const transferResult = await transfer.json();
   assert.equal(await balance(accountA), 75777n);
   assert.equal(await balance(accountB), 25000n);
+  const transferReplay = await fetch(`${baseUrl}/api/transfers`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${accessToken(userId)}`,
+      'content-type': 'application/json',
+      'Idempotency-Key': 'http-db-transfer',
+    },
+    body: JSON.stringify({ sourceAccountId: accountA, destinationAccountId: accountB, amountPaise: '25000' }),
+  });
+  assert.equal(transferReplay.status, 201);
+  assert.deepEqual(await transferReplay.json(), transferResult);
+  assert.equal(await balance(accountA), 75777n);
+  assert.equal(await balance(accountB), 25000n);
 
   const transferRead = await fetch(`${baseUrl}/api/transfers/${transferResult.journalTransactionId}`, {
     headers: { authorization: `Bearer ${accessToken(userId)}` },
@@ -331,8 +350,147 @@ test('financial HTTP endpoints persist through the PostgreSQL runtime role', {
   );
   assert.equal((await apiGet(`/api/accounts/${accountA}/statement`, auditorId)).status, 200);
   assert.equal((await apiGet(`/api/accounts/${accountB}/statement`, auditorId)).status, 404);
-
+  const auditorDeposit = await apiPost('/api/deposits', auditorId, { accountId: accountA, amountPaise: '1' }, 'auditor-deposit');
+  assert.equal(auditorDeposit.status, 403);
+  assert.equal((await auditorDeposit.json()).reason, 'role_forbidden');
+  const auditorWithdrawal = await apiPost('/api/withdrawals', auditorId, { accountId: accountA, amountPaise: '1' }, 'auditor-withdrawal');
+  assert.equal(auditorWithdrawal.status, 403);
+  assert.equal((await auditorWithdrawal.json()).reason, 'role_forbidden');
   const adminId = await createTestUser('ADMIN');
+
+  const noDeposit = await createFinancialFixture(1, {
+    canView: true, canDeposit: false, canWithdraw: true, canTransfer: true,
+  });
+  const noDepositBefore = await balance(noDeposit.accountIds[0]);
+  const depositDenied = await postDatabaseTransaction({
+    actorId: noDeposit.userId, type: 'DEPOSIT', destinationAccountId: noDeposit.accountIds[0],
+    amountPaise: 1n, idempotencyKey: 'deposit-capability-denied',
+  });
+  assert.equal(depositDenied.response_status, 403);
+  assert.equal(depositDenied.response_body.reason, 'not_authorized');
+  assert.equal(await balance(noDeposit.accountIds[0]), noDepositBefore);
+  const unauthorizedDeposit = await postDatabaseTransaction({
+    actorId: noDeposit.userId, type: 'DEPOSIT', destinationAccountId: accountA,
+    amountPaise: 1n, idempotencyKey: 'another-holders-deposit-denied',
+  });
+  assert.equal(unauthorizedDeposit.response_status, 403);
+  assert.equal(unauthorizedDeposit.response_body.reason, 'not_authorized');
+  assert.equal(await balance(accountA), 75777n);
+
+  const noWithdrawal = await createFinancialFixture(1, {
+    canView: true, canDeposit: true, canWithdraw: false, canTransfer: true,
+  });
+  await postDatabaseTransaction({
+    actorId: noWithdrawal.userId, type: 'DEPOSIT', destinationAccountId: noWithdrawal.accountIds[0],
+    amountPaise: 500n, idempotencyKey: 'withdrawal-capability-funding',
+  });
+  const noWithdrawalBefore = await balance(noWithdrawal.accountIds[0]);
+  const withdrawalDenied = await postDatabaseTransaction({
+    actorId: noWithdrawal.userId, type: 'WITHDRAWAL', sourceAccountId: noWithdrawal.accountIds[0],
+    amountPaise: 1n, idempotencyKey: 'withdrawal-capability-denied',
+  });
+  assert.equal(withdrawalDenied.response_status, 403);
+  assert.equal(withdrawalDenied.response_body.reason, 'not_authorized');
+  assert.equal(await balance(noWithdrawal.accountIds[0]), noWithdrawalBefore);
+
+  const noTransfer = await createFinancialFixture(2, {
+    canView: true, canDeposit: true, canWithdraw: true, canTransfer: false,
+  });
+  await postDatabaseTransaction({
+    actorId: noTransfer.userId, type: 'DEPOSIT', destinationAccountId: noTransfer.accountIds[0],
+    amountPaise: 500n, idempotencyKey: 'transfer-capability-funding',
+  });
+  const transferDenied = await postDatabaseTransaction({
+    actorId: noTransfer.userId, type: 'TRANSFER', sourceAccountId: noTransfer.accountIds[0],
+    destinationAccountId: noTransfer.accountIds[1], amountPaise: 1n,
+    idempotencyKey: 'transfer-capability-denied',
+  });
+  assert.equal(transferDenied.response_status, 403);
+  assert.equal(transferDenied.response_body.reason, 'not_authorized');
+  assert.equal(await balance(noTransfer.accountIds[0]), 500n);
+  assert.equal(await balance(noTransfer.accountIds[1]), 0n);
+  const unauthorizedWithdrawal = await postDatabaseTransaction({
+    actorId: noTransfer.userId, type: 'WITHDRAWAL', sourceAccountId: accountA,
+    amountPaise: 1n, idempotencyKey: 'another-holders-withdrawal-denied',
+  });
+  assert.equal(unauthorizedWithdrawal.response_status, 403);
+  assert.equal(unauthorizedWithdrawal.response_body.reason, 'not_authorized');
+  assert.equal(await balance(accountA), 75777n);
+
+  const noDestinationView = await createFinancialFixture(1);
+  const destinationOwner = await createFinancialFixture(1);
+  await postDatabaseTransaction({
+    actorId: noDestinationView.userId, type: 'DEPOSIT', destinationAccountId: noDestinationView.accountIds[0],
+    amountPaise: 100n, idempotencyKey: 'transfer-destination-funding',
+  });
+  const destinationDenied = await postDatabaseTransaction({
+    actorId: noDestinationView.userId, type: 'TRANSFER', sourceAccountId: noDestinationView.accountIds[0],
+    destinationAccountId: destinationOwner.accountIds[0], amountPaise: 1n,
+    idempotencyKey: 'transfer-destination-not-visible',
+  });
+  assert.equal(destinationDenied.response_status, 403);
+  assert.equal(destinationDenied.response_body.reason, 'not_authorized');
+  assert.equal(await balance(noDestinationView.accountIds[0]), 100n);
+  assert.equal(await balance(destinationOwner.accountIds[0]), 0n);
+
+  const missingAccountId = randomUUID();
+  const missingAccount = await postDatabaseTransaction({
+    actorId: adminId, type: 'WITHDRAWAL', sourceAccountId: missingAccountId,
+    amountPaise: 1n, idempotencyKey: 'missing-admin-account',
+  });
+  assert.equal(missingAccount.response_status, 409);
+  assert.equal(missingAccount.response_body.reason, 'account_unavailable');
+
+  // Refusal evidence must not retain a nonexistent FK, while idempotency and
+  // audit evidence must still be committed with the expected response.
+  const missingWithdrawalEvidence = await admin.query(`
+    SELECT a.id, a."sourceAccountId", a."destinationAccountId", a.status,
+           a."refusalReason", i."responseStatus", i."responseBody"
+      FROM public."TransactionAttempt" AS a
+      JOIN public."IdempotencyRecord" AS i ON i.id=a."idempotencyRecordId"
+     WHERE i."userId"=$1 AND i."idempotencyKey"=$2`,
+  [adminId, 'missing-admin-account']);
+  assert.equal(missingWithdrawalEvidence.rows.length, 1);
+  assert.equal(missingWithdrawalEvidence.rows[0].sourceAccountId, null);
+  assert.equal(missingWithdrawalEvidence.rows[0].destinationAccountId, null);
+  assert.equal(missingWithdrawalEvidence.rows[0].status, 'REFUSED');
+  assert.equal(missingWithdrawalEvidence.rows[0].refusalReason, 'account_unavailable');
+  assert.equal(missingWithdrawalEvidence.rows[0].responseStatus, 409);
+  assert.deepEqual(missingWithdrawalEvidence.rows[0].responseBody, {
+    status: 'REFUSED', reason: 'account_unavailable',
+  });
+
+  const missingWithdrawalAudit = await admin.query(`
+    SELECT count(*)::int AS count
+      FROM public."AuditLog"
+     WHERE action='TRANSACTION_REFUSED'
+       AND "entityType"='TransactionAttempt'
+       AND "entityId"=$1`,
+  [missingWithdrawalEvidence.rows[0].id]);
+  assert.equal(missingWithdrawalAudit.rows[0].count, 1);
+
+  // When one side exists, preserve its valid FK while nulling only the missing side.
+  const missingTransferSourceId = randomUUID();
+  const missingSourceTransfer = await postDatabaseTransaction({
+    actorId: adminId, type: 'TRANSFER', sourceAccountId: missingTransferSourceId,
+    destinationAccountId: noTransfer.accountIds[0], amountPaise: 1n,
+    idempotencyKey: 'missing-transfer-source',
+  });
+  assert.equal(missingSourceTransfer.response_status, 409);
+  assert.equal(missingSourceTransfer.response_body.reason, 'account_unavailable');
+  const missingTransferEvidence = await admin.query(`
+    SELECT a."sourceAccountId", a."destinationAccountId", a.status, a."refusalReason"
+      FROM public."TransactionAttempt" AS a
+      JOIN public."IdempotencyRecord" AS i ON i.id=a."idempotencyRecordId"
+     WHERE i."userId"=$1 AND i."idempotencyKey"=$2`,
+  [adminId, 'missing-transfer-source']);
+  assert.deepEqual(missingTransferEvidence.rows, [{
+    sourceAccountId: null,
+    destinationAccountId: noTransfer.accountIds[0],
+    status: 'REFUSED',
+    refusalReason: 'account_unavailable',
+  }]);
+
   const clearingAccount = await admin.query(`SELECT id FROM public."Account" WHERE "systemCode"='CLEARING_DEPOSIT_INR'`);
   assert.equal((await apiGet(`/api/accounts/${accountA}/statement`, adminId)).status, 200);
   assert.equal((await apiGet('/api/audit?perPage=100', adminId)).status, 200);

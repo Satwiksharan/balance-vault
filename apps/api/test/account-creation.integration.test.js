@@ -109,6 +109,8 @@ test('account creation function privileges and authenticated HTTP creation are e
   await admin.query(`
     INSERT INTO public."Account" ("id", "accountNumber", "systemCode", "type", "status", "balancePaise", "currencyCode", "updatedAt")
     VALUES ('00000000-0000-0000-0000-000000000012', 'BV-CLEAR-DEP', 'CLEARING_DEPOSIT_INR',
+            'SYSTEM_CLEARING', 'ACTIVE', 0, 'INR', clock_timestamp()),
+           ('00000000-0000-0000-0000-000000000013', 'BV-CLEAR-WD', 'CLEARING_WITHDRAWAL_INR',
             'SYSTEM_CLEARING', 'ACTIVE', 0, 'INR', clock_timestamp())
     ON CONFLICT ("systemCode") DO NOTHING
   `);
@@ -146,8 +148,8 @@ test('account creation function privileges and authenticated HTTP creation are e
       userId: holderId,
       canView: true,
       canDeposit: true,
-      canWithdraw: false,
-      canTransfer: false,
+      canWithdraw: true,
+      canTransfer: true,
       balancePaise: '0',
       systemCode: null,
     });
@@ -207,6 +209,70 @@ test('account creation function privileges and authenticated HTTP creation are e
       action: 'TRANSACTION_POSTED',
       entityId: deposit.journalTransactionId,
     }]);
+
+    const withdrawalResponse = await fetch(`${instance.url}/api/withdrawals`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${holderToken}`,
+        'content-type': 'application/json',
+        'Idempotency-Key': `account-creation-withdrawal-${randomUUID()}`,
+      },
+      body: JSON.stringify({ accountId: account.id, amountPaise: '2500' }),
+    });
+    assert.equal(withdrawalResponse.status, 201);
+    const withdrawal = await withdrawalResponse.json();
+    const withdrawalPostings = await admin.query(
+      `SELECT count(*)::int AS count, sum("amountPaise")::text AS total
+         FROM public."LedgerEntry" WHERE "journalTransactionId"=$1`,
+      [withdrawal.journalTransactionId],
+    );
+    assert.deepEqual(withdrawalPostings.rows[0], { count: 2, total: '0' });
+
+    const secondAccountNumber = `BV-${randomUUID()}`;
+    const secondAccountResponse = await fetch(`${instance.url}/api/accounts`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        accountNumber: secondAccountNumber,
+        accountType: 'PERSONAL',
+        holderUserId: holderId,
+      }),
+    });
+    assert.equal(secondAccountResponse.status, 201);
+    const { account: secondAccount } = await secondAccountResponse.json();
+    const transferResponse = await fetch(`${instance.url}/api/transfers`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${holderToken}`,
+        'content-type': 'application/json',
+        'Idempotency-Key': `account-creation-transfer-${randomUUID()}`,
+      },
+      body: JSON.stringify({
+        sourceAccountId: account.id,
+        destinationAccountId: secondAccount.id,
+        amountPaise: '1000',
+      }),
+    });
+    assert.equal(transferResponse.status, 201);
+    const transfer = await transferResponse.json();
+    const transferPostings = await admin.query(
+      `SELECT count(*)::int AS count, sum("amountPaise")::text AS total
+         FROM public."LedgerEntry" WHERE "journalTransactionId"=$1`,
+      [transfer.journalTransactionId],
+    );
+    assert.deepEqual(transferPostings.rows[0], { count: 2, total: '0' });
+    const postTransactionBalances = await admin.query(
+      `SELECT id, "balancePaise"::text AS balance FROM public."Account"
+        WHERE id=ANY($1::uuid[]) ORDER BY id`,
+      [[account.id, secondAccount.id]],
+    );
+    assert.deepEqual(postTransactionBalances.rows, [
+      { id: account.id, balance: '9000' },
+      { id: secondAccount.id, balance: '1000' },
+    ].sort((left, right) => left.id.localeCompare(right.id)));
 
     const audit = await admin.query(
       `SELECT "actorId",action,"entityType","entityId" FROM public."AuditLog" WHERE "entityId"=$1`,

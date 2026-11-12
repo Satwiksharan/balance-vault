@@ -88,7 +88,7 @@ test('profiles, password changes, user status and account onboarding preserve da
     `SELECT "canView","canDeposit","canWithdraw","canTransfer" FROM public."AccountPermission" WHERE "userId"=$1 AND "accountId"=$2`,
     [holderId, opened.rows[0].id],
   );
-  assert.deepEqual(permission.rows[0], { canView: true, canDeposit: true, canWithdraw: false, canTransfer: false });
+  assert.deepEqual(permission.rows[0], { canView: true, canDeposit: true, canWithdraw: true, canTransfer: true });
 
   await assert.rejects(
     runtime.query('SELECT public.admin_set_user_active($1,$2,false) AS changed', [adminId, holderId]),

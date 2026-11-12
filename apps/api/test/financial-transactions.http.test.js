@@ -71,10 +71,11 @@ function fakePrisma() {
       if (actor.role === 'AUDITOR') return refuse(403, 'role_forbidden');
       const source = sourceId ? accounts.get(sourceId) : null;
       const destination = destinationId ? accounts.get(destinationId) : null;
-      if ((sourceId && !source) || (destinationId && !destination)) return refuse(403, 'not_authorized');
+      if ((sourceId && !source) || (destinationId && !destination)) return refuse(409, 'account_unavailable');
       if (type === 'DEPOSIT' && !permission(userId, destinationId, 'canDeposit')) return refuse(403, 'not_authorized');
       if (type === 'WITHDRAWAL' && !permission(userId, sourceId, 'canWithdraw')) return refuse(403, 'not_authorized');
       if (type === 'TRANSFER' && !permission(userId, sourceId, 'canTransfer')) return refuse(403, 'not_authorized');
+      if (type === 'TRANSFER' && !permission(userId, destinationId, 'canView')) return refuse(403, 'not_authorized');
       if ([source, destination].filter(Boolean).some((account) => account.status !== 'ACTIVE')) return refuse(409, 'account_unavailable');
       if ((type === 'WITHDRAWAL' || type === 'TRANSFER') && source.balance < amount) return refuse(422, 'insufficient_funds');
 
@@ -185,6 +186,14 @@ test('deposit, withdrawal and transfer return database posting results with inte
   assert.equal(accounts.get(accountA).balance + accounts.get(accountB).balance, 80000n);
 
   const transferBody = await transfer.json();
+  const transferReplay = await request('/api/transfers', {
+    body: { sourceAccountId: accountA, destinationAccountId: accountB, amountPaise: '30000' },
+    key: 'transfer',
+  });
+  assert.equal(transferReplay.status, 201);
+  assert.deepEqual(await transferReplay.json(), transferBody);
+  assert.equal(accounts.get(accountA).balance, 50000n);
+  assert.equal(accounts.get(accountB).balance, 30000n);
   const lookup = await request(`/api/transfers/${transferBody.journalTransactionId}`, { method: 'GET' });
   assert.equal(lookup.status, 200);
   const { transfer: record } = await lookup.json();
@@ -207,8 +216,58 @@ test('insufficient funds and unauthorized accounts produce persisted refusals wi
   assert.equal(attempts.at(-1).status, 'REFUSED');
 
   const missing = await request('/api/deposits', { body: { accountId: missingAccount, amountPaise: '1' }, key: 'missing-account' });
-  assert.equal(missing.status, 403);
-  assert.equal(attempts.at(-1).reason, 'not_authorized');
+  assert.equal(missing.status, 409);
+  assert.equal(attempts.at(-1).reason, 'account_unavailable');
+});
+
+test('operation-specific capabilities and destination visibility are enforced', async () => {
+  permissions.delete(`${actorId}:${accountA}:canDeposit`);
+  const deposit = await request('/api/deposits', {
+    body: { accountId: accountA, amountPaise: '100' }, key: 'no-deposit-capability',
+  });
+  assert.equal(deposit.status, 403);
+  assert.equal((await deposit.json()).reason, 'not_authorized');
+  assert.equal(accounts.get(accountA).balance, 0n);
+
+  permissions.add(`${actorId}:${accountA}:canDeposit`);
+  permissions.delete(`${actorId}:${accountA}:canWithdraw`);
+  const withdrawal = await request('/api/withdrawals', {
+    body: { accountId: accountA, amountPaise: '1' }, key: 'no-withdraw-capability',
+  });
+  assert.equal(withdrawal.status, 403);
+  assert.equal((await withdrawal.json()).reason, 'not_authorized');
+  assert.equal(accounts.get(accountA).balance, 0n);
+
+  permissions.add(`${actorId}:${accountA}:canWithdraw`);
+  permissions.delete(`${actorId}:${accountB}:canView`);
+  const transfer = await request('/api/transfers', {
+    body: { sourceAccountId: accountA, destinationAccountId: accountB, amountPaise: '1' },
+    key: 'destination-not-visible',
+  });
+  assert.equal(transfer.status, 403);
+  assert.equal((await transfer.json()).reason, 'not_authorized');
+  assert.equal(accounts.get(accountA).balance, 0n);
+  assert.equal(accounts.get(accountB).balance, 0n);
+  assert.equal(journals.size, 0);
+});
+
+test('auditors cannot deposit or withdraw even when granted account permissions', async () => {
+  const auditorId = randomUUID();
+  users.set(auditorId, { id: auditorId, role: 'AUDITOR', isActive: true, tokenVersion: 0 });
+  permissions.add(`${auditorId}:${accountA}:canDeposit`);
+  permissions.add(`${auditorId}:${accountA}:canWithdraw`);
+  const deposit = await request('/api/deposits', {
+    userId: auditorId, body: { accountId: accountA, amountPaise: '1' }, key: 'auditor-no-deposit',
+  });
+  const withdrawal = await request('/api/withdrawals', {
+    userId: auditorId, body: { accountId: accountA, amountPaise: '1' }, key: 'auditor-no-withdrawal',
+  });
+  assert.equal(deposit.status, 403);
+  assert.equal(withdrawal.status, 403);
+  assert.equal((await deposit.json()).reason, 'role_forbidden');
+  assert.equal((await withdrawal.json()).reason, 'role_forbidden');
+  assert.equal(accounts.get(accountA).balance, 0n);
+  assert.equal(journals.size, 0);
 });
 
 test('amounts, account IDs, idempotency keys, and unauthenticated requests are validated', async () => {

@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { cp, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import pg from 'pg';
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -9,8 +9,87 @@ const apiDirectory = path.resolve(scriptDirectory, '..');
 const repositoryRoot = path.resolve(apiDirectory, '../..');
 const prismaCli = path.join(repositoryRoot, 'node_modules', 'prisma', 'build', 'index.js');
 const migrationName = '20261109000000_admin_transaction_access';
+const expectedDatabase = 'neondb';
+const expectedMigrationRole = 'balancevault_migration_owner';
+const expectedPostingOwner = 'balancevault_posting_owner';
 
-function runPrismaDeploy(configPath = path.join(apiDirectory, 'prisma.migrate.config.js')) {
+class MigrationPreflightError extends Error {}
+
+function validateMigrationTarget(env) {
+  const connectionString = env.MIGRATION_DATABASE_URL;
+  if (!connectionString) throw new MigrationPreflightError('MIGRATION_DATABASE_URL is required.');
+
+  let url;
+  try {
+    url = new URL(connectionString);
+  } catch {
+    throw new MigrationPreflightError('MIGRATION_DATABASE_URL must be a valid PostgreSQL URL.');
+  }
+  if (!['postgres:', 'postgresql:'].includes(url.protocol)) {
+    throw new MigrationPreflightError('MIGRATION_DATABASE_URL must use PostgreSQL.');
+  }
+
+  const isLocalDisposable = (url.hostname === '127.0.0.1' || url.hostname === 'localhost')
+    && decodeURIComponent(url.pathname.slice(1)).endsWith('_test')
+    && decodeURIComponent(url.pathname.slice(1)) !== 'balancevault_dev';
+
+  if (!isLocalDisposable) {
+    const expectedHostValue = env.MIGRATION_EXPECTED_NEON_HOST?.trim();
+    if (!expectedHostValue) {
+      throw new MigrationPreflightError('MIGRATION_EXPECTED_NEON_HOST must be set to the expected Neon production hostname.');
+    }
+    let expectedHostUrl;
+    try {
+      expectedHostUrl = new URL(`https://${expectedHostValue}`);
+    } catch {
+      throw new MigrationPreflightError('MIGRATION_EXPECTED_NEON_HOST must be an exact *.neon.tech hostname without a port.');
+    }
+    const expectedHost = expectedHostValue.toLowerCase();
+    if (expectedHostUrl.hostname !== expectedHost || expectedHostUrl.host !== expectedHost
+      || !expectedHost.endsWith('.neon.tech')) {
+      throw new MigrationPreflightError('MIGRATION_EXPECTED_NEON_HOST must be an exact *.neon.tech hostname without a port.');
+    }
+    if (url.hostname.toLowerCase() !== expectedHost || !url.hostname.toLowerCase().endsWith('.neon.tech')) {
+      throw new MigrationPreflightError('MIGRATION_DATABASE_URL does not target MIGRATION_EXPECTED_NEON_HOST.');
+    }
+    if (decodeURIComponent(url.pathname.slice(1)) !== expectedDatabase) {
+      throw new MigrationPreflightError('MIGRATION_DATABASE_URL must target database neondb.');
+    }
+    if (!['require', 'verify-ca', 'verify-full'].includes(url.searchParams.get('sslmode')?.toLowerCase())) {
+      throw new MigrationPreflightError('MIGRATION_DATABASE_URL must require TLS using sslmode=require, verify-ca, or verify-full.');
+    }
+  }
+
+  if (decodeURIComponent(url.username) !== expectedMigrationRole) {
+    throw new MigrationPreflightError('MIGRATION_DATABASE_URL must authenticate as balancevault_migration_owner.');
+  }
+  return { url, isLocalDisposable };
+}
+
+async function verifyMigrationIdentity(client, isLocalDisposable = false) {
+  await client.query('BEGIN TRANSACTION READ ONLY');
+  try {
+    const { rows: [identity] } = await client.query(`
+      SELECT current_database() AS database,
+             current_user AS current_role,
+             session_user AS login_role,
+             current_setting('transaction_read_only') AS read_only
+    `);
+    if (identity?.read_only !== 'on') {
+      throw new MigrationPreflightError('Migration identity preflight did not establish a read-only transaction.');
+    }
+    if (!isLocalDisposable && identity.database !== expectedDatabase) {
+      throw new MigrationPreflightError('MIGRATION_DATABASE_URL connected to a database other than neondb.');
+    }
+    if (identity.current_role !== expectedMigrationRole || identity.login_role !== expectedMigrationRole) {
+      throw new MigrationPreflightError('MIGRATION_DATABASE_URL must connect and remain as balancevault_migration_owner.');
+    }
+  } finally {
+    await client.query('ROLLBACK');
+  }
+}
+
+function runPrismaDeploy(configPath = path.join(apiDirectory, 'prisma.migrate.config.js'), env = process.env) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [
       prismaCli,
@@ -18,7 +97,7 @@ function runPrismaDeploy(configPath = path.join(apiDirectory, 'prisma.migrate.co
       'deploy',
       '--config',
       configPath,
-    ], { cwd: apiDirectory, env: process.env, stdio: 'inherit' });
+    ], { cwd: apiDirectory, env, stdio: 'inherit' });
     const forwardInterrupt = (signal) => child.kill(signal);
     process.on('SIGINT', forwardInterrupt);
     process.on('SIGTERM', forwardInterrupt);
@@ -65,12 +144,7 @@ async function createPreAdminMigrationConfig() {
   return { configPath, temporaryDirectory };
 }
 
-async function needsPostingOwnerCreate(client) {
-  const current = await client.query('SELECT current_user AS role');
-  if (current.rows[0]?.role !== 'balancevault_migration_owner') {
-    throw new Error('MIGRATION_DATABASE_URL must connect as balancevault_migration_owner');
-  }
-
+async function needsPostingOwnerCreate(client, onGrantAttempt) {
   const history = await client.query("SELECT pg_catalog.to_regclass('public.\"_prisma_migrations\"') IS NOT NULL AS exists");
   if (history.rows[0].exists) {
     const failed = await client.query(
@@ -92,28 +166,45 @@ async function needsPostingOwnerCreate(client) {
   }
 
   const privilege = await client.query(
-    `SELECT pg_catalog.has_schema_privilege('balancevault_posting_owner', 'public', 'CREATE') AS allowed`,
+    'SELECT pg_catalog.has_schema_privilege($1, $2, $3) AS allowed',
+    [expectedPostingOwner, 'public', 'CREATE'],
   );
   if (privilege.rows[0]?.allowed) return false;
-  await client.query('GRANT CREATE ON SCHEMA public TO balancevault_posting_owner');
-  const granted = await client.query(
-    `SELECT pg_catalog.has_schema_privilege('balancevault_posting_owner', 'public', 'CREATE') AS allowed`,
-  );
-  if (!granted.rows[0]?.allowed) throw new Error('Could not prepare the posting-owner schema privilege');
-  console.info('Temporary posting-owner CREATE privilege prepared for the pending function replacement.');
+  onGrantAttempt();
+  await client.query(`GRANT CREATE ON SCHEMA public TO ${expectedPostingOwner}`);
   return true;
 }
 
-async function main() {
-  const connectionString = process.env.MIGRATION_DATABASE_URL;
-  if (!connectionString) throw new Error('MIGRATION_DATABASE_URL is required');
+async function verifyPostingOwnerCreate(client, logger) {
+  const privilege = await client.query(
+    'SELECT pg_catalog.has_schema_privilege($1, $2, $3) AS allowed',
+    [expectedPostingOwner, 'public', 'CREATE'],
+  );
+  if (!privilege.rows[0]?.allowed) throw new Error('Could not prepare the posting-owner schema privilege');
+  logger.info('Temporary posting-owner CREATE privilege prepared for the pending function replacement.');
+}
 
-  const client = new pg.Client({ connectionString });
+export async function main({
+  env = process.env,
+  createClient = (options) => new pg.Client(options),
+  deploy = runPrismaDeploy,
+  preparePreAdminConfig = createPreAdminMigrationConfig,
+  logger = console,
+} = {}) {
+  const { isLocalDisposable } = validateMigrationTarget(env);
+  const client = createClient({ connectionString: env.MIGRATION_DATABASE_URL });
+  let clientConnected = false;
   let addedPrivilege = false;
   let deployExitCode = 1;
+  let cleanupFailed = false;
   let temporaryMigrationDirectory;
   try {
     await client.connect();
+    clientConnected = true;
+
+    // This read-only identity check must remain ahead of every deploy and grant.
+    await verifyMigrationIdentity(client, isLocalDisposable);
+
     const history = await client.query("SELECT pg_catalog.to_regclass('public.\"_prisma_migrations\"') IS NOT NULL AS exists");
     let targetApplied = false;
     if (history.rows[0].exists) {
@@ -134,38 +225,59 @@ async function main() {
     }
 
     if (!targetApplied) {
-      const temporary = await createPreAdminMigrationConfig();
+      const temporary = await preparePreAdminConfig();
       temporaryMigrationDirectory = temporary.temporaryDirectory;
-      const prefixExitCode = await runPrismaDeploy(temporary.configPath);
+      const prefixExitCode = await deploy(temporary.configPath, env);
       if (prefixExitCode !== 0) {
         deployExitCode = prefixExitCode;
       } else {
-        addedPrivilege = await needsPostingOwnerCreate(client);
-        deployExitCode = await runPrismaDeploy();
+        await needsPostingOwnerCreate(client, () => { addedPrivilege = true; });
+        if (addedPrivilege) await verifyPostingOwnerCreate(client, logger);
+        deployExitCode = await deploy(path.join(apiDirectory, 'prisma.migrate.config.js'), env);
       }
     } else {
-      deployExitCode = await runPrismaDeploy();
+      deployExitCode = await deploy(path.join(apiDirectory, 'prisma.migrate.config.js'), env);
     }
   } finally {
     if (addedPrivilege) {
       try {
         await client.query('REVOKE CREATE ON SCHEMA public FROM balancevault_posting_owner');
-        console.info('Temporary posting-owner CREATE privilege removed.');
+        logger.info('Temporary posting-owner CREATE privilege removed.');
       } catch {
-        console.error('Migration cleanup failed: remove the temporary CREATE privilege from balancevault_posting_owner before continuing.');
-        deployExitCode = 1;
+        logger.error('Migration cleanup failed: could not revoke CREATE on public from balancevault_posting_owner. Verify and revoke this temporary grant before continuing.');
+        cleanupFailed = true;
       }
     }
-    await client.end().catch(() => {});
+    if (clientConnected) {
+      try {
+        await client.end();
+      } catch {
+        logger.error('Migration cleanup failed: could not close the migration database connection.');
+        cleanupFailed = true;
+      }
+    }
     if (temporaryMigrationDirectory) {
-      await rm(temporaryMigrationDirectory, { recursive: true, force: true });
+      try {
+        await rm(temporaryMigrationDirectory, { recursive: true, force: true });
+      } catch {
+        logger.error('Migration cleanup failed: could not remove the temporary migration directory.');
+        cleanupFailed = true;
+      }
     }
   }
-  process.exitCode = deployExitCode;
+  return cleanupFailed ? 1 : deployExitCode;
 }
 
-main().catch((error) => {
-  const code = typeof error?.code === 'string' ? ` (database code ${error.code})` : '';
-  console.error(`Migration preflight failed${code}; verify the migration login, schema ownership, and migration state.`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+  main()
+    .then((exitCode) => { process.exitCode = exitCode; })
+    .catch((error) => {
+      if (error instanceof MigrationPreflightError) {
+        console.error(`Migration preflight failed: ${error.message}`);
+      } else {
+        const code = typeof error?.code === 'string' ? ` (database code ${error.code})` : '';
+        console.error(`Migration runner failed${code}; verify the migration target, owner role, and migration state.`);
+      }
+      process.exitCode = 1;
+    });
+}
