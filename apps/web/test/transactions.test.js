@@ -61,3 +61,23 @@ test('submission guard blocks duplicate submissions until the pending request fi
   assert.equal(guard.tryBegin(), true);
   guard.finish();
 });
+
+test('transaction payload key ignores extra display metadata and formatPaiseForInput formats correctly', () => {
+  const payloadWithMeta = {
+    type: 'TRANSFER',
+    sourceAccountId: 'acc-1',
+    destinationAccountId: 'acc-2',
+    amountPaise: '50000',
+    sourceAccountNumber: '01',
+    destinationAccountNumber: '02',
+  };
+  const payloadWithoutMeta = {
+    type: 'TRANSFER',
+    sourceAccountId: 'acc-1',
+    destinationAccountId: 'acc-2',
+    amountPaise: '50000',
+  };
+  const key1 = createTransactionAttempt(null, payloadWithMeta, () => 'id-1');
+  const key2 = createTransactionAttempt(key1, payloadWithoutMeta, () => 'id-2');
+  assert.equal(key1.idempotencyKey, key2.idempotencyKey);
+});

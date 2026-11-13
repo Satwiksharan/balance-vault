@@ -127,8 +127,12 @@ export default function FinancialTransactionPage({ type, onNavigate }) {
       setAmountError('Choose an account returned by your account list.');
       return;
     }
+    if (isTransfer && accounts.length < 2) {
+      setAmountError('Transfer requires at least two accounts. You currently have 1 account available.');
+      return;
+    }
     if (isTransfer && (!destinationAccountId || !destinationAccount)) {
-      setAmountError('Choose a destination account.');
+      setAmountError('Choose a destination account number.');
       return;
     }
     if (isTransfer && sourceAccountId === destinationAccountId) {
@@ -141,6 +145,8 @@ export default function FinancialTransactionPage({ type, onNavigate }) {
       ...(isDeposit ? { accountId: sourceAccountId } : {}),
       ...(type === 'withdrawal' ? { accountId: sourceAccountId } : {}),
       ...(isTransfer ? { sourceAccountId, destinationAccountId } : {}),
+      sourceAccountNumber: sourceAccount?.accountNumber,
+      destinationAccountNumber: destinationAccount?.accountNumber,
       amountPaise,
     };
 
@@ -167,8 +173,6 @@ export default function FinancialTransactionPage({ type, onNavigate }) {
     setOutcome(null);
     const inFlightAttempt = { ...prepared, state: 'uncertain' };
     try {
-      // Persist the retry key before sending bytes. A reload or route change
-      // during the request must restore an uncertain attempt, not a new draft.
       savePendingTransaction(user.id, details.type, inFlightAttempt);
       setAttempt(inFlightAttempt);
     } catch {
@@ -179,7 +183,16 @@ export default function FinancialTransactionPage({ type, onNavigate }) {
       return;
     }
     try {
-      const { type: _type, ...body } = inFlightAttempt.payload;
+      const body = isTransfer
+        ? {
+            sourceAccountId: inFlightAttempt.payload.sourceAccountId,
+            destinationAccountId: inFlightAttempt.payload.destinationAccountId,
+            amountPaise: inFlightAttempt.payload.amountPaise,
+          }
+        : {
+            accountId: inFlightAttempt.payload.accountId,
+            amountPaise: inFlightAttempt.payload.amountPaise,
+          };
       const result = await request(details.endpoint, {
         method: 'POST',
         body,
@@ -189,16 +202,41 @@ export default function FinancialTransactionPage({ type, onNavigate }) {
         const unexpected = new ApiError('The server response did not confirm a posted transaction.', 502, result);
         throw unexpected;
       }
+
+      const sourceNum = inFlightAttempt.payload.sourceAccountNumber || sourceAccount?.accountNumber;
+      const destNum = inFlightAttempt.payload.destinationAccountNumber || destinationAccount?.accountNumber;
+      const formattedAmount = formatPaiseAsINR(inFlightAttempt.payload.amountPaise);
+      const successMessage = isDeposit
+        ? `Successfully deposited ${formattedAmount} into Account ${sourceNum || ''}. Funds have been credited.`
+        : type === 'withdrawal'
+          ? `Successfully withdrew ${formattedAmount} from Account ${sourceNum || ''}. Funds have been debited.`
+          : `Successfully transferred ${formattedAmount} from Account ${sourceNum || ''} to Account ${destNum || ''}. Account ${sourceNum} was debited and Account ${destNum} was credited.`;
+
       clearPendingTransaction(user.id, details.type);
       setAttempt(null);
-      setOutcome({ kind: 'posted', result, payload: inFlightAttempt.payload });
+      setOutcome({
+        kind: 'posted',
+        result,
+        message: successMessage,
+        payload: {
+          ...inFlightAttempt.payload,
+          sourceAccountNumber: sourceNum,
+          destinationAccountNumber: destNum,
+        },
+      });
       setStage('result');
       refreshAccounts();
     } catch (error) {
       if (error?.payload?.status === 'REFUSED') {
         clearPendingTransaction(user.id, details.type);
         setAttempt(null);
-        setOutcome({ kind: 'refused', reason: error.payload.reason, message: getReason(error), payload: inFlightAttempt.payload, httpStatus: error.status });
+        setOutcome({
+          kind: 'refused',
+          reason: error.payload.reason,
+          message: getReason(error),
+          payload: inFlightAttempt.payload,
+          httpStatus: error.status,
+        });
         setStage('result');
         refreshAccounts();
       } else if (error?.payload?.error === 'idempotency_key_conflict') {
@@ -241,34 +279,162 @@ export default function FinancialTransactionPage({ type, onNavigate }) {
       <button className="back-link" onClick={() => onNavigate('/dashboard')}>← <span>Back to overview</span></button>
       <div className="transaction-page-heading"><span className="section-kicker">SECURE MONEY MOVEMENT</span><h1>{details.title}</h1><p>{details.intro}</p></div>
 
-      {accountsLoading ? <div className="loading-row"><span className="spinner spinner-dark" />Loading permitted accounts</div>
-        : accountError ? <div className="account-error-panel" role="alert"><span className="error-mark">!</span><div><strong>Accounts could not be loaded</strong><p>{accountError}</p></div><button className="button button-outline" onClick={() => refreshAccounts()}>Retry</button></div>
-          : accounts.length === 0 ? <div className="empty-state transaction-empty"><strong>No accounts available</strong><p>Money movement requires an account returned by your account access list.</p></div>
-            : stage === 'form' ? (
-              <form className="transaction-form-card" onSubmit={reviewTransaction}>
-                <div className="transaction-form-top"><span className="transaction-type-mark">{isDeposit ? '↓' : isTransfer ? '↗' : '↑'}</span><div><strong>{details.title} details</strong><small>Amounts are entered in Indian rupees (INR).</small></div></div>
-                <div className={`transaction-fields ${isTransfer ? 'transaction-fields-transfer' : ''}`}>
-                  <label className="field-label"><span>{isDeposit ? 'Deposit to account' : isTransfer ? 'From account' : 'Withdraw from account'}</span><select value={sourceAccountId} onChange={(event) => { setSourceAccountId(event.target.value); setSelectedAccountId(event.target.value); if (isTransfer && event.target.value === destinationAccountId) setDestinationAccountId(accounts.find((account) => account.id !== event.target.value)?.id ?? ''); }} required><option value="" disabled>Select an account</option>{accounts.map((account) => <option key={account.id} value={account.id}>{account.accountNumber} · {account.type}</option>)}</select></label>
-                  {isTransfer && <label className="field-label"><span>To account</span><select value={destinationAccountId} onChange={(event) => setDestinationAccountId(event.target.value)} required><option value="" disabled>Select destination</option>{accounts.filter((account) => account.id !== sourceAccountId).map((account) => <option key={account.id} value={account.id}>{account.accountNumber} · {account.type}</option>)}</select></label>}
-                  <label className="field-label amount-field"><span>Amount</span><span className="amount-input-wrap"><span aria-hidden="true">₹</span><input type="text" inputMode="decimal" autoComplete="off" maxLength={24} value={amount} onChange={(event) => { setAmount(event.target.value); setAmountError(''); }} placeholder="0.00" aria-describedby="amount-help" required /></span><small id="amount-help" className="field-hint">Up to two decimal places. The server rechecks available funds before posting.</small></label>
-                </div>
-                {sourceAccount && <div className="selected-account-summary"><span className="account-summary-icon">{sourceAccount.type === 'BUSINESS' ? 'B' : 'P'}</span><div><strong>{sourceAccount.accountNumber}</strong><small>{sourceAccount.type} · {sourceAccount.status} · {sourceAccount.currencyCode}</small></div>{sourceBalance && !sourceBalance.error && <span className="summary-balance">{formatPaiseAsINR(sourceBalance.balancePaise, sourceBalance.currencyCode)}</span>}</div>}
-                {isTransfer && destinationAccount && <div className="selected-account-summary destination-summary"><span className="account-summary-icon">{destinationAccount.type === 'BUSINESS' ? 'B' : 'P'}</span><div><strong>{destinationAccount.accountNumber}</strong><small>Destination · {destinationAccount.status} · {destinationAccount.currencyCode}</small></div>{destinationBalance && !destinationBalance.error && <span className="summary-balance">{formatPaiseAsINR(destinationBalance.balancePaise, destinationBalance.currencyCode)}</span>}</div>}
-                {sourceBalance?.error && <p className="balance-unavailable-note">The current balance could not be loaded. The server will validate the transaction.</p>}
-                {exceedsBalance && <div className="balance-warning" role="status">The amount exceeds the displayed balance. The backend is authoritative and will refuse an overdraft.</div>}
-                {amountError && <div className="form-error" role="alert"><span>!</span>{amountError}</div>}
-                <div className="transaction-form-footer"><span><i /> All postings are confirmed by the secure ledger.</span><button className="button button-primary" type="submit">Review {details.verb}<span aria-hidden="true">→</span></button></div>
-              </form>
-            ) : stage === 'review' ? (
-              <div className="transaction-review-card" role="region" aria-labelledby="transaction-review-title">
-                <div className="review-topline"><span className="section-kicker">FINAL CHECK</span><span className="review-step">STEP 2 OF 2</span></div>
-                <h2 id="transaction-review-title">Review your {details.verb}</h2><p className="review-description">Check the details carefully before sending this request to the ledger.</p>
-                <div className="review-route"><ReviewParty label={isDeposit ? 'DEPOSIT TO' : 'FROM'} account={sourceAccount ?? accountFromPayload(accounts, attempt?.payload, 'source')} />{isTransfer ? <><span className="review-route-arrow">→</span><ReviewParty label="TRANSFER TO" account={destinationAccount ?? accountFromPayload(accounts, attempt?.payload, 'destination')} /></> : null}</div>
-                <div className="review-amount"><span>AMOUNT</span><strong>{attempt?.payload?.amountPaise ? displayAmount(attempt.payload.amountPaise) : '—'}</strong></div>
-                <div className="idempotency-note"><span className="idempotency-lock">✓</span><p>A unique request key is saved for this transaction. If the connection is interrupted, retrying uses the same key and payload.</p></div>
-                <div className="review-actions"><button className="button button-outline" onClick={() => setStage('form')} disabled={submitting}>Back to edit</button><button className="button button-primary" onClick={() => submitPrepared()} disabled={submitting}>{submitting ? <><span className="spinner" />Submitting…</> : <>Confirm and submit <span aria-hidden="true">→</span></>}</button></div>
+      {stage === 'result' ? (
+        <TransactionResult
+          outcome={outcome}
+          attempt={attempt}
+          submitting={submitting}
+          onRetry={() => submitPrepared(attempt)}
+          onEdit={() => setStage('form')}
+          onNew={resetForNewTransaction}
+          accounts={accounts}
+          onNavigate={onNavigate}
+        />
+      ) : accountsLoading ? (
+        <div className="loading-row"><span className="spinner spinner-dark" />Loading permitted accounts</div>
+      ) : accountError ? (
+        <div className="account-error-panel" role="alert"><span className="error-mark">!</span><div><strong>Accounts could not be loaded</strong><p>{accountError}</p></div><button className="button button-outline" onClick={() => refreshAccounts()}>Retry</button></div>
+      ) : accounts.length === 0 ? (
+        <div className="empty-state transaction-empty"><strong>No accounts available</strong><p>Money movement requires an account returned by your account access list.</p></div>
+      ) : stage === 'form' ? (
+        <form className="transaction-form-card" onSubmit={reviewTransaction}>
+          <div className="transaction-form-top">
+            <span className="transaction-type-mark">{isDeposit ? '↓' : isTransfer ? '↗' : '↑'}</span>
+            <div><strong>{details.title} details</strong><small>Amounts are entered in Indian rupees (INR).</small></div>
+          </div>
+          <div className={`transaction-fields ${isTransfer ? 'transaction-fields-transfer' : ''}`}>
+            <label className="field-label">
+              <span>{isDeposit ? 'Deposit to account number (Credit)' : isTransfer ? 'From account number (Debit)' : 'Withdraw from account number (Debit)'}</span>
+              <select
+                value={sourceAccountId}
+                onChange={(event) => {
+                  setSourceAccountId(event.target.value);
+                  setSelectedAccountId(event.target.value);
+                  if (isTransfer && event.target.value === destinationAccountId) {
+                    setDestinationAccountId(accounts.find((account) => account.id !== event.target.value)?.id ?? '');
+                  }
+                }}
+                required
+              >
+                <option value="" disabled>Select account number</option>
+                {accounts.map((account) => (
+                  <option key={account.id} value={account.id}>
+                    Account {account.accountNumber} ({account.type})
+                  </option>
+                ))}
+              </select>
+            </label>
+            {isTransfer && (
+              <label className="field-label">
+                <span>To account number (Credit)</span>
+                <select
+                  value={destinationAccountId}
+                  onChange={(event) => setDestinationAccountId(event.target.value)}
+                  required
+                >
+                  <option value="" disabled>Select destination account number</option>
+                  {accounts.filter((account) => account.id !== sourceAccountId).map((account) => (
+                    <option key={account.id} value={account.id}>
+                      Account {account.accountNumber} ({account.type})
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            <label className="field-label amount-field">
+              <span>Amount</span>
+              <span className="amount-input-wrap">
+                <span aria-hidden="true">₹</span>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  autoComplete="off"
+                  maxLength={24}
+                  value={amount}
+                  onChange={(event) => { setAmount(event.target.value); setAmountError(''); }}
+                  placeholder="0.00"
+                  aria-describedby="amount-help"
+                  required
+                />
+              </span>
+              <small id="amount-help" className="field-hint">Up to two decimal places. The server rechecks available funds before posting.</small>
+            </label>
+          </div>
+          {isTransfer && accounts.length < 2 && (
+            <div className="transfer-help-banner">
+              Transfer moves money between accounts. You currently have 1 account available. Please open an additional account or ensure destination accounts are assigned to your profile.
+            </div>
+          )}
+          {sourceAccount && (
+            <div className="selected-account-summary">
+              <span className="account-summary-icon">{sourceAccount.type === 'BUSINESS' ? 'B' : 'P'}</span>
+              <div>
+                <strong>Account Number: {sourceAccount.accountNumber}</strong>
+                <small>{isTransfer ? 'Debit account (Funds deducted)' : isDeposit ? 'Deposit account (Funds credited)' : 'Withdrawal account (Funds deducted)'} · {sourceAccount.type} · {sourceAccount.currencyCode}</small>
               </div>
-            ) : <TransactionResult outcome={outcome} attempt={attempt} submitting={submitting} onRetry={() => submitPrepared(attempt)} onEdit={() => setStage('form')} onNew={resetForNewTransaction} accounts={accounts} />}
+              {sourceBalance && !sourceBalance.error && (
+                <span className="summary-balance">{formatPaiseAsINR(sourceBalance.balancePaise, sourceBalance.currencyCode)}</span>
+              )}
+            </div>
+          )}
+          {isTransfer && destinationAccount && (
+            <div className="selected-account-summary destination-summary">
+              <span className="account-summary-icon">{destinationAccount.type === 'BUSINESS' ? 'B' : 'P'}</span>
+              <div>
+                <strong>Account Number: {destinationAccount.accountNumber}</strong>
+                <small>Credit account (Funds credited) · {destinationAccount.type} · {destinationAccount.currencyCode}</small>
+              </div>
+              {destinationBalance && !destinationBalance.error && (
+                <span className="summary-balance">{formatPaiseAsINR(destinationBalance.balancePaise, destinationBalance.currencyCode)}</span>
+              )}
+            </div>
+          )}
+          {sourceBalance?.error && <p className="balance-unavailable-note">The current balance could not be loaded. The server will validate the transaction.</p>}
+          {exceedsBalance && <div className="balance-warning" role="status">The amount exceeds the displayed balance. The backend is authoritative and will refuse an overdraft.</div>}
+          {amountError && <div className="form-error" role="alert"><span>!</span>{amountError}</div>}
+          <div className="transaction-form-footer">
+            <span><i /> All postings are confirmed by the secure ledger.</span>
+            <button className="button button-primary" type="submit">
+              Review {details.verb}<span aria-hidden="true">→</span>
+            </button>
+          </div>
+        </form>
+      ) : stage === 'review' ? (
+        <div className="transaction-review-card" role="region" aria-labelledby="transaction-review-title">
+          <div className="review-topline"><span className="section-kicker">FINAL CHECK</span><span className="review-step">STEP 2 OF 2</span></div>
+          <h2 id="transaction-review-title">Review your {details.verb}</h2>
+          <p className="review-description">Check the details carefully before sending this request to the ledger.</p>
+          <div className="review-route">
+            <ReviewParty
+              label={isDeposit ? 'DEPOSIT TO (CREDITED)' : isTransfer ? 'DEBIT FROM ACCOUNT' : 'WITHDRAW FROM (DEBITED)'}
+              account={sourceAccount ?? accountFromPayload(accounts, attempt?.payload, 'source')}
+            />
+            {isTransfer ? (
+              <>
+                <span className="review-route-arrow">→</span>
+                <ReviewParty
+                  label="CREDIT TO ACCOUNT"
+                  account={destinationAccount ?? accountFromPayload(accounts, attempt?.payload, 'destination')}
+                />
+              </>
+            ) : null}
+          </div>
+          <div className="review-amount">
+            <span>AMOUNT</span>
+            <strong>{attempt?.payload?.amountPaise ? displayAmount(attempt.payload.amountPaise) : '—'}</strong>
+          </div>
+          <div className="idempotency-note">
+            <span className="idempotency-lock">✓</span>
+            <p>A unique request key is saved for this transaction. If the connection is interrupted, retrying uses the same key and payload.</p>
+          </div>
+          <div className="review-actions">
+            <button className="button button-outline" onClick={() => setStage('form')} disabled={submitting}>Back to edit</button>
+            <button className="button button-primary" onClick={() => submitPrepared()} disabled={submitting}>
+              {submitting ? <><span className="spinner" />Submitting…</> : <>Confirm and submit <span aria-hidden="true">→</span></>}
+            </button>
+          </div>
+        </div>
+      ) : null}
 
       <p className="transaction-security-note">No balance is changed in the browser. The backend authorizes each request, enforces idempotency, and confirms ledger postings.</p>
     </section>
@@ -276,7 +442,13 @@ export default function FinancialTransactionPage({ type, onNavigate }) {
 }
 
 function ReviewParty({ label, account }) {
-  return <div className="review-party"><span>{label}</span><strong>{account?.accountNumber ?? 'Selected account'}</strong><small>{account ? `${account.type} · ${account.currencyCode}` : 'Account details unavailable'}</small></div>;
+  return (
+    <div className="review-party">
+      <span>{label}</span>
+      <strong>Account {account?.accountNumber ?? 'Selected account'}</strong>
+      <small>{account ? `${account.type === 'BUSINESS' ? 'Business Account' : 'Personal Account'} · ${account.currencyCode}` : 'Account details unavailable'}</small>
+    </div>
+  );
 }
 
 function accountFromPayload(accounts, payload, side) {
@@ -284,7 +456,7 @@ function accountFromPayload(accounts, payload, side) {
   return accounts.find((account) => account.id === id);
 }
 
-function TransactionResult({ outcome, attempt, submitting, onRetry, onEdit, onNew }) {
+function TransactionResult({ outcome, attempt, submitting, onRetry, onEdit, onNew, accounts = [], onNavigate }) {
   if (!outcome) return <div className="transaction-result-card"><div className="loading-row"><span className="spinner spinner-dark" />Preparing transaction result</div></div>;
   const posted = outcome.kind === 'posted';
   const refused = outcome.kind === 'refused';
@@ -294,30 +466,127 @@ function TransactionResult({ outcome, attempt, submitting, onRetry, onEdit, onNe
   const amountPaise = outcome.result?.amountPaise ?? payload?.amountPaise;
   const reference = outcome.result?.journalTransactionId;
   const typeName = payload?.type === 'DEPOSIT' ? 'Deposit' : payload?.type === 'WITHDRAWAL' ? 'Withdrawal' : 'Transfer';
+  const isTransfer = payload?.type === 'TRANSFER';
+  const isDeposit = payload?.type === 'DEPOSIT';
 
-  return <section className={`transaction-result-card result-${outcome.kind}`} aria-live="polite" aria-labelledby="transaction-result-title">
-    <span className={`result-mark ${posted ? 'result-mark-success' : refused ? 'result-mark-refused' : 'result-mark-pending'}`}>{posted ? '✓' : refused ? '!' : uncertain ? '…' : conflict ? '!' : '×'}</span>
-    <span className="section-kicker">{posted ? 'LEDGER CONFIRMATION' : refused ? 'REQUEST REFUSED' : uncertain ? 'CONFIRMATION PENDING' : conflict ? 'IDEMPOTENCY CONFLICT' : 'REQUEST ERROR'}</span>
-    <h2 id="transaction-result-title">{posted ? 'Transaction posted' : refused ? 'Transaction was not posted' : uncertain ? 'Result not confirmed' : conflict ? 'Request key conflict' : 'Transaction could not be completed'}</h2>
-    <p className="result-message">{outcome.message ?? outcome.reason}</p>
-    {(posted || refused) && <div className="result-receipt"><div><span>Type</span><strong>{typeName}</strong></div><div><span>Account</span><strong>{describeAccounts(payload, accounts)}</strong></div><div><span>Amount</span><strong>{amountPaise ? formatPaiseAsINR(amountPaise) : '—'}</strong></div><div><span>Status</span><strong className={posted ? 'posted-text' : 'refused-text'}>{posted ? 'POSTED' : 'REFUSED'}</strong></div>{reference && <div><span>Journal reference</span><strong className="receipt-reference">{reference}</strong></div>}{outcome.reason && <div><span>Reason</span><strong>{outcome.reason.replaceAll('_', ' ')}</strong></div>}</div>}
-    {uncertain && <div className="uncertain-warning"><strong>Do not create another request.</strong><span>Use “Retry same request” to check the original result. The original key and exact payload are retained.</span></div>}
-    {conflict && <div className="uncertain-warning"><strong>No replacement key was created.</strong><span>Starting a new transaction is a separate money movement request. Continue only if that is intentional.</span></div>}
-    <div className="result-actions">
-      {uncertain && <button className="button button-primary" onClick={onRetry} disabled={submitting}>{submitting ? <><span className="spinner" />Checking…</> : 'Retry same request'}</button>}
-      {outcome.kind === 'error' && <button className="button button-outline" onClick={onEdit}>Edit details</button>}
-      {(posted || refused || conflict || outcome.kind === 'error') && <button className="button button-outline" onClick={onNew}>Start another transaction</button>}
-      {posted && payload?.type === 'TRANSFER' && reference && <button className="button button-primary" onClick={() => onNavigate(`/transfers/${encodeURIComponent(reference)}`)}>View transfer details</button>}
-      {(posted || refused) && <span className="result-confirmed-note">{posted ? 'Confirmed by the backend.' : 'Refusal recorded by the backend.'}</span>}
-    </div>
-  </section>;
-}
-
-function describeAccounts(payload, accounts) {
   const sourceId = payload?.sourceAccountId ?? payload?.accountId;
   const destinationId = payload?.destinationAccountId;
-  const source = accounts.find((account) => account.id === sourceId)?.accountNumber ?? 'Account';
-  if (!destinationId) return source;
-  const destination = accounts.find((account) => account.id === destinationId)?.accountNumber ?? 'Account';
-  return `${source} → ${destination}`;
+  const sourceNum = payload?.sourceAccountNumber ?? accounts.find((a) => a.id === sourceId)?.accountNumber ?? 'Account';
+  const destinationNum = payload?.destinationAccountNumber ?? accounts.find((a) => a.id === destinationId)?.accountNumber ?? 'Account';
+
+  return (
+    <section className={`transaction-result-card result-${outcome.kind}`} aria-live="polite" aria-labelledby="transaction-result-title">
+      <span className={`result-mark ${posted ? 'result-mark-success' : refused ? 'result-mark-refused' : 'result-mark-pending'}`}>
+        {posted ? '✓' : refused ? '!' : uncertain ? '…' : conflict ? '!' : '×'}
+      </span>
+      <span className="section-kicker">
+        {posted ? 'LEDGER CONFIRMATION' : refused ? 'REQUEST REFUSED' : uncertain ? 'CONFIRMATION PENDING' : conflict ? 'IDEMPOTENCY CONFLICT' : 'REQUEST ERROR'}
+      </span>
+      <h2 id="transaction-result-title">
+        {posted ? `${typeName} successful` : refused ? 'Transaction was not posted' : uncertain ? 'Result not confirmed' : conflict ? 'Request key conflict' : 'Transaction could not be completed'}
+      </h2>
+      <p className="result-message">
+        {outcome.message ?? outcome.reason}
+      </p>
+
+      {(posted || refused) && (
+        <div className="result-receipt">
+          <div>
+            <span>Transaction Type</span>
+            <strong>{typeName}</strong>
+          </div>
+          {isTransfer ? (
+            <>
+              <div>
+                <span>From Account (Debited)</span>
+                <strong>Account Number {sourceNum}</strong>
+              </div>
+              <div>
+                <span>To Account (Credited)</span>
+                <strong>Account Number {destinationNum}</strong>
+              </div>
+            </>
+          ) : isDeposit ? (
+            <div>
+              <span>Deposited To (Credited)</span>
+              <strong>Account Number {sourceNum}</strong>
+            </div>
+          ) : (
+            <div>
+              <span>Withdrawn From (Debited)</span>
+              <strong>Account Number {sourceNum}</strong>
+            </div>
+          )}
+          <div>
+            <span>Amount</span>
+            <strong>{amountPaise ? formatPaiseAsINR(amountPaise) : '—'}</strong>
+          </div>
+          <div>
+            <span>Status</span>
+            <strong className={posted ? 'posted-text' : 'refused-text'}>
+              {posted ? 'POSTED · SUCCESSFUL' : 'REFUSED'}
+            </strong>
+          </div>
+          {reference && (
+            <div>
+              <span>Journal Reference</span>
+              <strong className="receipt-reference">{reference}</strong>
+            </div>
+          )}
+          {outcome.reason && (
+            <div>
+              <span>Reason</span>
+              <strong>{outcome.reason.replaceAll('_', ' ')}</strong>
+            </div>
+          )}
+        </div>
+      )}
+
+      {uncertain && (
+        <div className="uncertain-warning">
+          <strong>Do not create another request.</strong>
+          <span>Use “Retry same request” to check the original result. The original key and exact payload are retained.</span>
+        </div>
+      )}
+      {conflict && (
+        <div className="uncertain-warning">
+          <strong>No replacement key was created.</strong>
+          <span>Starting a new transaction is a separate money movement request. Continue only if that is intentional.</span>
+        </div>
+      )}
+
+      <div className="result-actions">
+        {uncertain && (
+          <button className="button button-primary" onClick={onRetry} disabled={submitting}>
+            {submitting ? <><span className="spinner" />Checking…</> : 'Retry same request'}
+          </button>
+        )}
+        {outcome.kind === 'error' && (
+          <button className="button button-outline" onClick={onEdit}>
+            Edit details
+          </button>
+        )}
+        {(posted || refused || conflict || outcome.kind === 'error') && (
+          <button className="button button-outline" onClick={onNew}>
+            Start another transaction
+          </button>
+        )}
+        {posted && (
+          <button className="button button-primary" onClick={() => onNavigate?.('/dashboard')}>
+            Back to Overview
+          </button>
+        )}
+        {posted && isTransfer && reference && (
+          <button className="button button-outline" onClick={() => onNavigate?.(`/transfers/${encodeURIComponent(reference)}`)}>
+            View transfer details
+          </button>
+        )}
+        {(posted || refused) && (
+          <span className="result-confirmed-note">
+            {posted ? 'Confirmed and posted to the secure ledger.' : 'Refusal recorded by the backend.'}
+          </span>
+        )}
+      </div>
+    </section>
+  );
 }
