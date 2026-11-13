@@ -186,13 +186,18 @@ async function verifyPostingOwnerCreate(client, logger) {
 
 export async function main({
   env = process.env,
-  createClient = (options) => new pg.Client(options),
+  createClient = (options) => new pg.Client({ keepAlive: true, keepAliveInitialDelayMillis: 1000, ...options }),
   deploy = runPrismaDeploy,
   preparePreAdminConfig = createPreAdminMigrationConfig,
   logger = console,
 } = {}) {
   const { isLocalDisposable } = validateMigrationTarget(env);
   const client = createClient({ connectionString: env.MIGRATION_DATABASE_URL });
+  if (typeof client?.on === 'function') {
+    client.on('error', (err) => {
+      logger.warn?.(`Migration database client connection event: ${err?.message ?? err}`);
+    });
+  }
   let clientConnected = false;
   let addedPrivilege = false;
   let deployExitCode = 1;

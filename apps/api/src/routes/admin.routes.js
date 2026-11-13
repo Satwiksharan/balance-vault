@@ -48,8 +48,8 @@ export function createAdminRouter(prismaClient) {
     const id = randomUUID();
     const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
     const context = [id, parsed.data.fullName, parsed.data.email, parsed.data.role, tokenHash, expiresAt.getTime()];
-    const assertion = createActorAssertion(request.auth.userId, 'INVITATION_CREATE', context);
     try {
+      const assertion = createActorAssertion(request.auth.userId, 'INVITATION_CREATE', context);
       const [invitation] = await prismaClient.$queryRaw`
         SELECT * FROM public.create_privileged_user_invitation_asserted(
           ${request.auth.userId}::uuid, ${id}::uuid, ${parsed.data.fullName}::text,
@@ -61,6 +61,13 @@ export function createAdminRouter(prismaClient) {
       response.set('Cache-Control', 'no-store');
       return response.status(201).json({ invitation: { ...invitation, token } });
     } catch (error) {
+      if (error?.message?.includes('BALANCEVAULT_ACTOR_ASSERTION_KEY')) {
+        console.warn('Admin invitation rejected', {
+          requestId: request.id,
+          category: 'actor_assertion_verifier_unavailable',
+        });
+        return response.status(503).json({ error: 'Invitation service is temporarily unavailable' });
+      }
       if (sqlState(error) === '42501' || sqlState(error) === '55000') {
         console.warn('Admin invitation rejected by PostgreSQL', {
           requestId: request.id,

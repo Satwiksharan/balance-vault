@@ -239,16 +239,42 @@ function AppShell({ pathname, forbidden = false }) {
 
 function DashboardPage({ request, user, accountRefreshVersion }) {
   const [accounts, setAccounts] = useState(null);
+  const [balances, setBalances] = useState({});
   const [error, setError] = useState('');
   useEffect(() => {
     const controller = new AbortController();
     fetchAccounts(request, { signal: controller.signal })
-      .then(setAccounts)
+      .then(async (items) => {
+        setAccounts(items);
+        const balanceEntries = await Promise.all(
+          items.map(async (account) => {
+            try {
+              const balance = await fetchAccountBalance(request, account.id, { signal: controller.signal });
+              return [account.id, balance];
+            } catch (balanceError) {
+              return [account.id, { error: balanceError.message }];
+            }
+          }),
+        );
+        if (!controller.signal.aborted) {
+          setBalances(Object.fromEntries(balanceEntries));
+        }
+      })
       .catch((requestError) => { if (requestError.name !== 'AbortError') setError(requestError.message); });
     return () => controller.abort();
   }, [accountRefreshVersion, request]);
   const firstName = user.fullName?.split(/\s+/)[0] || user.email.split('@')[0];
   const activeCount = accounts?.filter((account) => account.status === 'ACTIVE').length ?? 0;
+  const totalPaise = accounts?.reduce((sum, account) => {
+    const bal = balances[account.id];
+    if (bal && !bal.error && bal.balancePaise) {
+      try { return sum + BigInt(bal.balancePaise); } catch { return sum; }
+    }
+    return sum;
+  }, 0n) ?? 0n;
+  const totalBalanceFormatted = accounts === null || Object.keys(balances).length === 0
+    ? '—'
+    : formatPaiseAsINR(totalPaise);
 
   return (
     <>
@@ -262,7 +288,7 @@ function DashboardPage({ request, user, accountRefreshVersion }) {
         <div className="section-heading"><div><span className="section-kicker">YOUR SPACE</span><h2>Account overview</h2></div><button className="text-link" onClick={() => navigate('/accounts')}>All accounts <Icon name="arrow" size={16} /></button></div>
         <div className="summary-grid">
           <div className="summary-card account-count-card"><span className="summary-icon"><Icon name="cards" size={19} /></span><span className="summary-label">Total accounts</span><strong>{accounts === null ? '—' : accounts.length.toString().padStart(2, '0')}</strong><small>{accounts === null ? 'Loading account data' : accounts.length === 1 ? 'Account connected' : 'Accounts connected'}</small><div className="summary-decoration" aria-hidden="true" /></div>
-          <div className="summary-card"><span className="summary-icon summary-icon-light"><Icon name="shield" size={19} /></span><span className="summary-label">Account status</span><strong className="summary-status">{accounts === null ? '—' : accounts.length === 0 ? 'No accounts' : 'In good order'}</strong><small>{accounts === null ? 'Checking your accounts' : `${activeCount} active ${activeCount === 1 ? 'account' : 'accounts'}`}</small><span className="summary-status-line"><i /></span></div>
+          <div className="summary-card"><span className="summary-icon summary-icon-light"><Icon name="shield" size={19} /></span><span className="summary-label">Available balance</span><strong className="summary-status">{totalBalanceFormatted}</strong><small>{accounts === null ? 'Checking your accounts' : `${activeCount} active ${activeCount === 1 ? 'account' : 'accounts'}`}</small><span className="summary-status-line"><i /></span></div>
         </div>
         {error && <div className="inline-error" role="alert"><span>We couldn’t load your accounts.</span><small>{error}</small><button onClick={() => window.location.reload()}>Try again</button></div>}
       </section>
@@ -270,7 +296,7 @@ function DashboardPage({ request, user, accountRefreshVersion }) {
       <div className="dashboard-lower-grid">
         <section className="section-block account-list-block">
           <div className="section-heading compact-heading"><div><span className="section-kicker">CONNECTED</span><h2>Your accounts</h2></div><button className="square-link" onClick={() => navigate('/accounts')} aria-label="View all accounts"><Icon name="arrow" size={17} /></button></div>
-          {accounts === null ? <div className="loading-row"><span className="spinner spinner-dark" />Loading accounts</div> : accounts.length === 0 ? <><EmptyState title="No accounts yet" detail="Customer accounts are opened after an administrator reviews your request." />{user.role === 'ACCOUNT_HOLDER' && <button className="button button-outline" onClick={() => navigate('/account-requests')}>Request an account</button>}</> : <div className="account-list">{accounts.slice(0, 4).map((account) => <AccountRow key={account.id} account={account} />)}</div>}
+          {accounts === null ? <div className="loading-row"><span className="spinner spinner-dark" />Loading accounts</div> : accounts.length === 0 ? <><EmptyState title="No accounts yet" detail="Customer accounts are opened after an administrator reviews your request." />{user.role === 'ACCOUNT_HOLDER' && <button className="button button-outline" onClick={() => navigate('/account-requests')}>Request an account</button>}</> : <div className="account-list">{accounts.slice(0, 4).map((account) => <AccountRow key={account.id} account={account} balance={balances[account.id]} />)}</div>}
           {accounts?.length > 4 && <button className="view-all-link" onClick={() => navigate('/accounts')}>View all {accounts.length} accounts <Icon name="arrow" size={15} /></button>}
         </section>
 
@@ -286,12 +312,12 @@ function DashboardPage({ request, user, accountRefreshVersion }) {
 
       {user.role === 'ADMIN' && <section className="section-block role-dashboard-panel"><span className="section-kicker">ADMINISTRATION</span><h2>Operations workspace</h2><p>Review account opening requests, manage user access, inspect the audit trail, and process customer transactions.</p><div className="role-dashboard-actions"><button className="button button-outline" onClick={() => navigate('/admin/onboarding')}>Review onboarding</button><button className="button button-outline" onClick={() => navigate('/admin/users')}>Manage users</button><button className="button button-outline" onClick={() => navigate('/audit')}>View audit log</button></div><div className="role-dashboard-actions"><button className="button button-outline" onClick={() => navigate('/transactions/deposit')}>Deposit</button><button className="button button-outline" onClick={() => navigate('/transactions/withdrawal')}>Withdrawal</button><button className="button button-outline" onClick={() => navigate('/transactions/transfer')}>Transfer</button></div></section>}
       {user.role === 'AUDITOR' && <section className="section-block role-dashboard-panel"><span className="section-kicker">READ ONLY</span><h2>Audit workspace</h2><p>Review assigned-account statements and the audit events available to your role.</p><button className="button button-outline" onClick={() => navigate('/audit')}>Open audit log</button></section>}
-      <DashboardActivity request={request} accounts={accounts} />
+      <DashboardActivity request={request} accounts={accounts} accountRefreshVersion={accountRefreshVersion} />
     </>
   );
 }
 
-function DashboardActivity({ request, accounts }) {
+function DashboardActivity({ request, accounts, accountRefreshVersion }) {
   const [statement, setStatement] = useState(null);
   const [error, setError] = useState('');
   const firstAccount = accounts?.[0];
@@ -301,7 +327,7 @@ function DashboardActivity({ request, accounts }) {
     fetchAccountStatement(request, firstAccount.id, { limit: 5, signal: controller.signal })
       .then(setStatement).catch((err) => { if (err.name !== 'AbortError') setError(err.status === 403 ? 'You do not have permission to view this account activity.' : err.message || 'Activity could not be loaded.'); });
     return () => controller.abort();
-  }, [firstAccount?.id, request]);
+  }, [firstAccount?.id, request, accountRefreshVersion]);
   return <section className="section-block activity-block">
     <div className="section-heading"><div><span className="section-kicker">LEDGER</span><h2>Transaction activity</h2></div>{firstAccount && <button className="text-link" onClick={() => navigate('/statements')}>Full statements <Icon name="arrow" size={16} /></button>}</div>
     {!accounts && <div className="loading-row"><span className="spinner spinner-dark" />Loading account activity</div>}
@@ -474,8 +500,9 @@ function ErrorPanel({ message, onRetry }) {
   return <div className="account-error-panel" role="alert"><span className="error-mark">!</span><div><strong>We couldn’t load the account information</strong><p>{message}</p></div><button className="button button-outline" onClick={onRetry}>Retry</button></div>;
 }
 
-function AccountRow({ account }) {
-  return <article className="account-row"><span className="account-symbol"><Icon name={account.type === 'BUSINESS' ? 'building' : 'cards'} size={18} /></span><span className="account-row-main"><strong>{account.accountNumber}</strong><small>{account.type === 'BUSINESS' ? 'Business account' : 'Personal account'}</small></span><span className={`status-pill status-${account.status.toLowerCase()}`}><i />{account.status.toLowerCase()}</span><span className="account-currency">{account.currencyCode}</span></article>;
+function AccountRow({ account, balance }) {
+  const balanceText = balance?.error ? 'Unavailable' : balance ? formatPaiseAsINR(balance.balancePaise, balance.currencyCode) : '—';
+  return <article className="account-row"><span className="account-symbol"><Icon name={account.type === 'BUSINESS' ? 'building' : 'cards'} size={18} /></span><span className="account-row-main"><strong>{account.accountNumber}</strong><small>{account.type === 'BUSINESS' ? 'Business account' : 'Personal account'}</small></span><span className={`status-pill status-${account.status.toLowerCase()}`}><i />{account.status.toLowerCase()}</span><strong className="account-balance-cell">{balanceText}</strong></article>;
 }
 
 function AccountCard({ account, balance, selected, onSelect }) {
